@@ -35,7 +35,7 @@ Entry point names (functions with `@compute`, `@vertex`, or `@fragment` attribut
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `include` | `RegExp` | `/\.wgsl(\?raw)?$/` | File pattern to match |
+| `include` | `RegExp` | `/\.wgsl/` | File pattern to match |
 | `preserve` | `string[]` | `[]` | Identifiers to keep (e.g. entry point names) |
 | `renameIdents` | `boolean` | `true` | Rename user-defined identifiers |
 | `stripComments` | `boolean` | `true` | Remove comments |

@@ -70,7 +70,7 @@ const BUILTINS = new Set([
 const SWIZZLE = new Set(["x", "y", "z", "w", "r", "g", "b", "a"]);
 
 export interface ObfuscateOptions {
-  /** File patterns to obfuscate (default: /\.wgsl(\?raw)?$/) */
+  /** File patterns to obfuscate (default: /\.wgsl/) */
   include?: RegExp;
   /** Preserve these identifiers (e.g. entry point names) */
   preserve?: string[];
@@ -405,15 +405,27 @@ function extractEntryPoints(tokens: Token[]): Set<string> {
   for (let i = 0; i < tokens.length; i++) {
     if (tokens[i].type !== "attribute" || !stageAttrs.has(tokens[i].value)) continue;
 
-    // Scan forward past attributes and whitespace to find "fn <name>"
+    // Scan forward past attributes, their (...) argument lists, and whitespace
+    // until we hit "fn <name>".
     let j = i + 1;
+    let parenDepth = 0;
     while (j < tokens.length) {
+      if (parenDepth > 0) {
+        if (tokens[j].type === "op" && tokens[j].value === "(") parenDepth++;
+        else if (tokens[j].type === "op" && tokens[j].value === ")") parenDepth--;
+        j++;
+        continue;
+      }
       if (tokens[j].type === "whitespace" || tokens[j].type === "attribute") {
         j++;
         continue;
       }
+      if (tokens[j].type === "op" && tokens[j].value === "(") {
+        parenDepth++;
+        j++;
+        continue;
+      }
       if (tokens[j].type === "ident" && tokens[j].value === "fn") {
-        // Next non-whitespace ident is the entry point name
         j++;
         while (j < tokens.length && tokens[j].type === "whitespace") j++;
         if (j < tokens.length && tokens[j].type === "ident") {
