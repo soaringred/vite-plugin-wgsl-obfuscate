@@ -22,24 +22,15 @@ describe("option toggles", () => {
     const out = runTransform(src, {
       collapseWhitespace: false,
       renameIdents: false,
-      splitConstants: false,
       inlineConsts: false,
     });
     expect(out).toContain("    ");
-  });
-
-  it("splitConstants=false leaves numbers untouched", () => {
-    const out = runTransform(`fn main() { let x = 3.14159; }`, {
-      splitConstants: false,
-    });
-    expect(out).toContain("3.14159");
   });
 
   it("inlineConsts=false keeps const declarations", () => {
     const out = runTransform(`const PI: f32 = 3.14159; fn main() { let x = PI; }`, {
       inlineConsts: false,
       renameIdents: false,
-      splitConstants: false,
     });
     expect(out).toContain("const");
     expect(out).toContain("PI");

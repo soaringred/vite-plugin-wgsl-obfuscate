@@ -1,6 +1,6 @@
 {
   "name": "vite-plugin-wgsl-obfuscate",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Vite plugin to obfuscate WGSL shader source in production builds",
   "type": "module",
   "sideEffects": false,
@@ -22,6 +22,7 @@
     "build": "tsup src/index.ts --format esm,cjs --dts",
     "test": "vitest run",
     "test:watch": "vitest",
+    "pack:local": "yarn build && yarn pack -o package.tgz",
     "prepublishOnly": "npm run test && npm run build"
   },
   "keywords": [

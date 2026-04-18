@@ -23,7 +23,6 @@ describe("basic obfuscation", () => {
 
   it("preserves WGSL builtin functions", () => {
     const out = runTransform(`fn main() { let x = sqrt(2.0); let y = mix(0.0, 1.0, 0.5); }`, {
-      splitConstants: false,
       inlineConsts: false,
     });
     expect(out).toContain("sqrt");
