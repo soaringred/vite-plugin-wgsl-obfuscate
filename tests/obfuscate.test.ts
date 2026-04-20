@@ -274,11 +274,12 @@ describe("rename identifiers", () => {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 describe("const inlining", () => {
-  /** Inline consts and reconstruct the source (no rename, no split). */
+  /** Inline consts and reconstruct the source. */
   function inlineSrc(src: string): string {
     const tokens = inlineConsts(tokenize(src));
     return tokens.map((t) => t.value).join("");
   }
+  const stripWs = (s: string) => s.replace(/\s+/g, "");
 
   it("replaces simple const with its value", () => {
     const out = inlineSrc("const X: f32 = 1.0; fn main() { let a = X; }");
@@ -331,6 +332,147 @@ describe("const inlining", () => {
     const out = inlineSrc("const PI: f32 = 3.14; fn main() { let x = PI; }");
     // No leftover "const" keyword from the declaration
     expect(out).not.toMatch(/const\s/);
+  });
+
+  // Nested precedence: when a multi-token const is inlined into ANOTHER
+  // const's RHS, the inlined form needs parens too — not just at the final
+  // use-site. The use-site wrap alone is insufficient.
+  describe("nested const precedence", () => {
+    it("parenthesizes multi-token const when inlined as left operand of higher-precedence op", () => {
+      // A = 1.0 + 2.0; B = A * 3.0; use B
+      // Correct: ((1.0+2.0)*3.0) = 9.0
+      // Bug:     (1.0+2.0*3.0)   = 7.0
+      const src = "const A: f32 = 1.0 + 2.0; const B: f32 = A * 3.0; fn main() { let v = B; }";
+      const out = stripWs(inlineSrc(src));
+      // Char before '*' must be ')' — i.e. A was parenthesized when inlined into B.
+      const mulPos = out.indexOf("*");
+      expect(mulPos).toBeGreaterThan(0);
+      expect(out[mulPos - 1]).toBe(")");
+    });
+
+    it("parenthesizes multi-token const when inlined as right operand of subtraction", () => {
+      // A = 1.0 + 2.0; B = 10.0 - A; use B
+      // Correct: (10.0-(1.0+2.0)) = 7.0
+      // Bug:     (10.0-1.0+2.0)   = 11.0  (left-assoc: (10-1)+2)
+      const src = "const A: f32 = 1.0 + 2.0; const B: f32 = 10.0 - A; fn main() { let v = B; }";
+      const out = stripWs(inlineSrc(src));
+      // After the '-' operator we expect '(' — A's inlined form must be wrapped.
+      const minusPos = out.indexOf("-");
+      expect(minusPos).toBeGreaterThan(0);
+      expect(out[minusPos + 1]).toBe("(");
+    });
+
+    it("parenthesizes multi-token const when inlined into division denominator", () => {
+      // A = 2.0 + 2.0; B = 8.0 / A; use B
+      // Correct: (8.0/(2.0+2.0)) = 2.0
+      // Bug:     (8.0/2.0+2.0)   = 6.0   (left-assoc: (8/2)+2)
+      const src = "const A: f32 = 2.0 + 2.0; const B: f32 = 8.0 / A; fn main() { let v = B; }";
+      const out = stripWs(inlineSrc(src));
+      const divPos = out.indexOf("/");
+      expect(divPos).toBeGreaterThan(0);
+      expect(out[divPos + 1]).toBe("(");
+    });
+
+    it("baseline: single-token nested const still inlines without wrapping", () => {
+      // A = 1.0 (single token) inlined into B = A + 2.0 should NOT be wrapped.
+      // Regression guard: fix for multi-token case must not over-parenthesize.
+      const src = "const A: f32 = 1.0; const B: f32 = A + 2.0; fn main() { let v = B; }";
+      const out = stripWs(inlineSrc(src));
+      // No "(1.0)" sub-expression should appear.
+      expect(out).not.toMatch(/\(1\.0\)/);
+    });
+  });
+
+  // Scoping: the inliner collects all `const` declarations into a single
+  // global map keyed by name. WGSL permits `const` in function bodies, so
+  // two functions can each declare `const X` with different values. The
+  // current code silently lets the second win and loses the first.
+  describe("scope collisions", () => {
+    it("handles two functions each declaring a const with the same name", () => {
+      const src = `
+        fn f() -> f32 { const X: f32 = 1.0; return X; }
+        fn g() -> f32 { const X: f32 = 2.0; return X; }
+      `;
+      const out = stripWs(inlineSrc(src));
+      // f must return 1.0, g must return 2.0 — both literals should appear.
+      // Bug: both usages collapse to the same value, and one decl is not removed.
+      expect(out).toMatch(/f\(\)->f32\{return1\.0;}/);
+      expect(out).toMatch(/g\(\)->f32\{return2\.0;}/);
+      // Also: no leftover `const` keyword (both decls should have been removed).
+      expect(out).not.toMatch(/const/);
+    });
+
+    it("handles local const shadowing a module-level const of the same name", () => {
+      const src = `
+        const X: f32 = 1.0;
+        fn g() -> f32 { const X: f32 = 2.0; return X; }
+        fn h() -> f32 { return X; }
+      `;
+      const out = stripWs(inlineSrc(src));
+      // g uses the local (2.0), h uses the module-level (1.0).
+      expect(out).toMatch(/g\(\)->f32\{return2\.0;}/);
+      expect(out).toMatch(/h\(\)->f32\{return1\.0;}/);
+      expect(out).not.toMatch(/const/);
+    });
+
+    it("handles shadowing inside a nested block (if-branch)", () => {
+      // Module-level X = 1.0. Inside an if-branch, local X = 2.0 shadows it.
+      // After the branch closes, the module-level X is visible again.
+      const src = `
+        const X: f32 = 1.0;
+        fn f() -> f32 {
+          var a: f32 = X;
+          if (true) { const X: f32 = 2.0; a = X; }
+          return X;
+        }
+      `;
+      const out = stripWs(inlineSrc(src));
+      // Pre-if `a = X` resolves to module X (1.0).
+      expect(out).toMatch(/vara:f32=1\.0;/);
+      // Inside if body, `a = X` resolves to local X (2.0).
+      expect(out).toMatch(/if\(true\)\{a=2\.0;}/);
+      // Post-if `return X` resolves back to module X (1.0).
+      expect(out).toMatch(/return1\.0;/);
+      // All const decls removed.
+      expect(out).not.toMatch(/const/);
+    });
+  });
+
+  // Cycle detection: when consts reference each other circularly, the source
+  // is not valid WGSL. The inliner must bail out (return the original tokens)
+  // rather than attempt to expand — otherwise it would loop forever or
+  // explode in token count.
+  describe("cycle detection", () => {
+    it("leaves both decls intact when a cycle is detected", () => {
+      const src = "const A: f32 = B; const B: f32 = A; fn main() { let v = A; }";
+      const out = inlineSrc(src);
+      // Both consts must remain (no inlining performed).
+      expect(out).toContain("const A");
+      expect(out).toContain("const B");
+    });
+
+    it("detects a self-referential cycle", () => {
+      const src = "const X: f32 = X + 1.0; fn main() { let v = X; }";
+      const out = inlineSrc(src);
+      // Self-ref is a cycle of one — must bail and leave decl alone.
+      expect(out).toContain("const X");
+    });
+  });
+
+  // Local consts must also get the precedence-wrap treatment now that
+  // they're inlined. The fix for multi-token consts has to extend to
+  // function-local scope.
+  describe("local const precedence", () => {
+    it("parenthesizes multi-token local const at its use-site", () => {
+      // Inside f: const K = 1.0 + 2.0; then K * 3.0
+      // Correct: (1.0+2.0)*3.0 = 9.0
+      const src = "fn f() -> f32 { const K: f32 = 1.0 + 2.0; return K * 3.0; }";
+      const out = stripWs(inlineSrc(src));
+      // The char immediately before '*' must be ')' — K was wrapped.
+      const mulPos = out.indexOf("*");
+      expect(mulPos).toBeGreaterThan(0);
+      expect(out[mulPos - 1]).toBe(")");
+    });
   });
 });
 

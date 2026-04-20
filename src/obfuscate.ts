@@ -7,8 +7,6 @@ export interface ObfuscateOptions {
   preserve?: string[];
   /** Rename user-defined identifiers (default: true) */
   renameIdents?: boolean;
-  /** Strip comments (default: true) */
-  stripComments?: boolean;
   /** Collapse whitespace (default: true) */
   collapseWhitespace?: boolean;
   /** Inline const declarations at usage sites (default: true) */
@@ -17,7 +15,6 @@ export interface ObfuscateOptions {
 
 const DEFAULTS: Required<Omit<ObfuscateOptions, "preserve">> = {
   renameIdents: true,
-  stripComments: true,
   collapseWhitespace: true,
   inlineConsts: true,
 };
@@ -34,7 +31,10 @@ const DEFAULTS: Required<Omit<ObfuscateOptions, "preserve">> = {
 export function obfuscate(src: string, options: ObfuscateOptions = {}): string {
   const flags = { ...DEFAULTS, ...options };
 
-  let tokens = tokenize(src);
+  // Strip comments as a first pass so no downstream transform has to
+  // reason about them. Comments carry no semantic weight and have no place
+  // in obfuscated output.
+  let tokens = tokenize(src).filter((t) => t.type !== "comment");
 
   // Auto-detect entry points and merge with manual preserve list
   const entryPoints = extractEntryPoints(tokens);
@@ -55,8 +55,6 @@ export function obfuscate(src: string, options: ObfuscateOptions = {}): string {
   let prevType: Token["type"] | null = null;
 
   for (const tok of tokens) {
-    if (flags.stripComments && tok.type === "comment") continue;
-
     if (tok.type === "whitespace") {
       if (flags.collapseWhitespace) {
         if (

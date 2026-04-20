@@ -10,14 +10,7 @@ describe("option toggles", () => {
     expect(out).toContain("myVar");
   });
 
-  it("stripComments=false keeps comments", () => {
-    const out = runTransform(`// keep me\nfn main() {}`, {
-      stripComments: false,
-    });
-    expect(out).toContain("keep me");
-  });
-
-  it("collapseWhitespace=false keeps original whitespace", () => {
+it("collapseWhitespace=false keeps original whitespace", () => {
     const src = `fn    main(  )   {   return;   }`;
     const out = runTransform(src, {
       collapseWhitespace: false,

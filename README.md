@@ -37,9 +37,8 @@ Entry point names (functions with `@compute`, `@vertex`, or `@fragment` attribut
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `include` | `RegExp` | `/\.wgsl/` | File pattern to match |
-| `preserve` | `string[]` | `[]` | Identifiers to keep (e.g. entry point names) |
+| `preserve` | `string[]` | `[]` | Additional identifiers to keep unrenamed (entry points are auto-detected) |
 | `renameIdents` | `boolean` | `true` | Rename user-defined identifiers |
-| `stripComments` | `boolean` | `true` | Remove comments |
 | `collapseWhitespace` | `boolean` | `true` | Minimize whitespace |
 | `inlineConsts` | `boolean` | `true` | Inline const declarations at usage sites |
 

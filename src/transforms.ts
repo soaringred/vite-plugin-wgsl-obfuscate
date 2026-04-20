@@ -59,10 +59,25 @@ export function buildRenameMap(
 
 // ── Inline const declarations ───────────────────────────────────────
 
+interface ConstDecl {
+  id: number;
+  name: string;
+  value: Token[];
+  scope: number;
+  declStart: number;
+  declEnd: number;
+}
+
 /**
  * Inline all `const` declarations at their usage sites and remove
  * the declarations. Resolves chained dependencies (const A referencing
  * const B) via topological expansion.
+ *
+ * Handles lexical scoping: `const` declarations inside function bodies
+ * only inline within their enclosing block, and shadow module-level consts
+ * of the same name. Brace depth is tracked via `{`/`}` tokens; WGSL uses
+ * these only for struct and function bodies, so depth tracking is reliable
+ * (const values use `()` for constructors, not `{}`).
  *
  * If any dependency cycle is detected (`const A = B; const B = A;`), the
  * source would not compile anyway, so we bail out of inlining entirely and
@@ -70,125 +85,185 @@ export function buildRenameMap(
  * our own inliner when given broken input.
  */
 export function inlineConsts(tokens: Token[]): Token[] {
-  const constValues = new Map<string, Token[]>();
-  const constRanges = new Map<string, { start: number; end: number }>();
+  // Scope tree: scopeParent[i] = parent of scope i (null for module scope).
+  const scopeParent: (number | null)[] = [null];
+  const scopeOf = new Array<number>(tokens.length);
 
-  // Pass 1: find const declarations and their value tokens
-  for (let i = 0; i < tokens.length; i++) {
-    if (tokens[i].type !== "ident" || tokens[i].value !== "const") continue;
+  const consts: ConstDecl[] = [];
+  const constsByName = new Map<string, ConstDecl[]>();
 
-    let j = i + 1;
-    while (j < tokens.length && tokens[j].type === "whitespace") j++;
-    if (j >= tokens.length || tokens[j].type !== "ident") continue;
-    const name = tokens[j].value;
+  // Pass 1: walk tokens, track brace-delimited scopes, collect const decls.
+  {
+    let scope = 0;
+    for (let i = 0; i < tokens.length; i++) {
+      const tok = tokens[i];
 
-    let eqIdx = j + 1;
-    while (
-      eqIdx < tokens.length &&
-      !(tokens[eqIdx].type === "op" && tokens[eqIdx].value === "=")
-    ) {
-      eqIdx++;
-    }
-    if (eqIdx >= tokens.length) continue;
-
-    const valueToks: Token[] = [];
-    let endIdx = eqIdx + 1;
-    while (
-      endIdx < tokens.length &&
-      !(tokens[endIdx].type === "op" && tokens[endIdx].value === ";")
-    ) {
-      if (valueToks.length === 0 && tokens[endIdx].type === "whitespace") {
-        endIdx++;
+      if (tok.type === "op" && tok.value === "{") {
+        scopeOf[i] = scope;
+        const newScope = scopeParent.length;
+        scopeParent.push(scope);
+        scope = newScope;
         continue;
       }
-      valueToks.push(tokens[endIdx]);
-      endIdx++;
-    }
+      if (tok.type === "op" && tok.value === "}") {
+        const p = scopeParent[scope];
+        if (p !== null) scope = p;
+        scopeOf[i] = scope;
+        continue;
+      }
+      scopeOf[i] = scope;
 
-    if (valueToks.length > 0) {
-      constValues.set(name, valueToks);
-      constRanges.set(name, { start: i, end: endIdx + 1 });
+      if (tok.type !== "ident" || tok.value !== "const") continue;
+
+      let j = i + 1;
+      while (j < tokens.length && tokens[j].type === "whitespace") j++;
+      if (j >= tokens.length || tokens[j].type !== "ident") continue;
+      const name = tokens[j].value;
+
+      let eqIdx = j + 1;
+      while (
+        eqIdx < tokens.length &&
+        !(tokens[eqIdx].type === "op" && tokens[eqIdx].value === "=")
+      ) {
+        eqIdx++;
+      }
+      if (eqIdx >= tokens.length) continue;
+
+      const valueToks: Token[] = [];
+      let endIdx = eqIdx + 1;
+      while (
+        endIdx < tokens.length &&
+        !(tokens[endIdx].type === "op" && tokens[endIdx].value === ";")
+      ) {
+        if (valueToks.length === 0 && tokens[endIdx].type === "whitespace") {
+          endIdx++;
+          continue;
+        }
+        valueToks.push(tokens[endIdx]);
+        endIdx++;
+      }
+
+      if (valueToks.length > 0) {
+        const decl: ConstDecl = {
+          id: consts.length,
+          name,
+          value: valueToks,
+          scope,
+          declStart: i,
+          declEnd: endIdx + 1, // include the `;`
+        };
+        consts.push(decl);
+        const list = constsByName.get(name);
+        if (list) list.push(decl);
+        else constsByName.set(name, [decl]);
+      }
     }
   }
 
+  // Resolve a name at a given scope to the innermost enclosing const decl.
+  // Walks up the scope chain, returning the first matching decl (shadowing).
+  const resolve = (name: string, atScope: number): ConstDecl | null => {
+    const candidates = constsByName.get(name);
+    if (!candidates) return null;
+    let cur: number | null = atScope;
+    while (cur !== null) {
+      for (const d of candidates) {
+        if (d.scope === cur) return d;
+      }
+      cur = scopeParent[cur];
+    }
+    return null;
+  };
+
   // Pass 2: DFS with color coding to detect cycles AND produce a
-  // topological order for acyclic consts simultaneously.
+  // topological order for acyclic consts simultaneously. Keyed per-decl
+  // (not per-name) so two decls sharing a name in different scopes are
+  // treated independently.
   const WHITE = 0;
   const GRAY = 1;
   const BLACK = 2;
-  const color = new Map<string, 0 | 1 | 2>();
-  const topoOrder: string[] = [];
+  const color = new Array<0 | 1 | 2>(consts.length).fill(WHITE);
+  const topoOrder: ConstDecl[] = [];
   let cycleFound = false;
-  for (const name of constValues.keys()) color.set(name, WHITE);
 
-  const visit = (name: string): void => {
-    if (cycleFound) return;
-    if (color.get(name) !== WHITE) return;
-    color.set(name, GRAY);
-    for (const tok of constValues.get(name) ?? []) {
-      if (tok.type !== "ident" || !constValues.has(tok.value)) continue;
-      const dep = tok.value;
-      if (color.get(dep) === GRAY) {
+  const visit = (d: ConstDecl): void => {
+    if (cycleFound || color[d.id] === BLACK) return;
+    color[d.id] = GRAY;
+    for (const tok of d.value) {
+      if (tok.type !== "ident") continue;
+      const dep = resolve(tok.value, d.scope);
+      if (!dep) continue;
+      if (color[dep.id] === GRAY) {
         cycleFound = true;
         return;
       }
       visit(dep);
       if (cycleFound) return;
     }
-    color.set(name, BLACK);
-    topoOrder.push(name); // post-order: dependencies appear before dependents
+    color[d.id] = BLACK;
+    topoOrder.push(d); // post-order: dependencies appear before dependents
   };
 
-  for (const name of constValues.keys()) {
-    visit(name);
+  for (const d of consts) {
+    visit(d);
     if (cycleFound) return tokens; // broken source; leave everything untouched
-  }
-
-  // Pass 3: expand each const in topological order.
-  // Each const's dependencies are fully expanded when we get to it, so one
-  // pass per const suffices (O(n·expanded-size)).
-  for (const name of topoOrder) {
-    const val = constValues.get(name)!;
-    const expanded: Token[] = [];
-    for (const tok of val) {
-      if (tok.type === "ident" && constValues.has(tok.value)) {
-        expanded.push(...constValues.get(tok.value)!);
-      } else {
-        expanded.push(tok);
-      }
-    }
-    constValues.set(name, expanded);
-  }
-
-  // Parenthesize multi-token values to preserve operator precedence at
-  // usage sites (e.g. `const K = 1+2; K*3` → `(1+2)*3`, not `1+2*3`).
-  const needsParens = new Set<string>();
-  for (const [name, toks] of constValues) {
-    const nonWs = toks.filter((t) => t.type !== "whitespace");
-    if (nonWs.length > 1) needsParens.add(name);
-  }
-
-  const removeIndices = new Set<number>();
-  for (const { start, end } of constRanges.values()) {
-    for (let i = start; i < end; i++) removeIndices.add(i);
   }
 
   const OPEN: Token = { type: "op", value: "(", start: 0, end: 0 };
   const CLOSE: Token = { type: "op", value: ")", start: 0, end: 0 };
 
+  // Pass 3: expand each const in topological order.
+  // Each const's dependencies are fully expanded when we get to it, so one
+  // pass per const suffices. Multi-token dependencies are wrapped in parens
+  // to preserve precedence — e.g. `const A = 1+2; const B = A*3` must
+  // expand B to `(1+2)*3`, not `1+2*3`.
+  for (const d of topoOrder) {
+    const expanded: Token[] = [];
+    for (const tok of d.value) {
+      if (tok.type === "ident") {
+        const dep = resolve(tok.value, d.scope);
+        if (dep) {
+          const depNonWs = dep.value.filter((t) => t.type !== "whitespace").length;
+          if (depNonWs > 1) expanded.push(OPEN, ...dep.value, CLOSE);
+          else expanded.push(...dep.value);
+          continue;
+        }
+      }
+      expanded.push(tok);
+    }
+    d.value = expanded;
+  }
+
+  // Parenthesize multi-token values at usage sites to preserve precedence
+  // (e.g. `const K = 1+2; K*3` → `(1+2)*3`, not `1+2*3`).
+  const needsParens = new Set<number>();
+  for (const d of consts) {
+    const nonWs = d.value.filter((t) => t.type !== "whitespace").length;
+    if (nonWs > 1) needsParens.add(d.id);
+  }
+
+  const removeIndices = new Set<number>();
+  for (const d of consts) {
+    for (let i = d.declStart; i < d.declEnd; i++) removeIndices.add(i);
+  }
+
+  // Pass 4: rebuild token stream. Use scopeOf[] from Pass 1 so each ident
+  // use resolves relative to its enclosing block.
   const result: Token[] = [];
   for (let i = 0; i < tokens.length; i++) {
     if (removeIndices.has(i)) continue;
-    if (tokens[i].type === "ident" && constValues.has(tokens[i].value)) {
-      const name = tokens[i].value;
-      if (needsParens.has(name)) {
-        result.push(OPEN, ...constValues.get(name)!, CLOSE);
-      } else {
-        result.push(...constValues.get(name)!);
+    if (tokens[i].type === "ident") {
+      const d = resolve(tokens[i].value, scopeOf[i]);
+      if (d) {
+        if (needsParens.has(d.id)) {
+          result.push(OPEN, ...d.value, CLOSE);
+        } else {
+          result.push(...d.value);
+        }
+        continue;
       }
-    } else {
-      result.push(tokens[i]);
     }
+    result.push(tokens[i]);
   }
   return result;
 }
