@@ -13,8 +13,8 @@ struct Params {
 @group(0) @binding(1) var<storage, read_write> output: array<vec4<f32>>;
 @group(0) @binding(2) var<uniform> params: Params;
 
-fn computeForce(pos: vec3<f32>, target: vec3<f32>) -> vec3<f32> {
-    let diff = target - pos;
+fn computeForce(pos: vec3<f32>, goal: vec3<f32>) -> vec3<f32> {
+    let diff = goal - pos;
     let dist = length(diff);
     if (dist < 0.001) { return vec3<f32>(0.0); }
     return normalize(diff) / (dist * dist);
